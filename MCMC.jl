@@ -1,7 +1,5 @@
 using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall,BenchmarkTools
 include("BaseUtils.jl") #Imports the methods on BaseUtils.jl
-include("PerformanceUtils.jl") #Imports the methods on PerformanceUtils.jl
-
 #=
 sample_MVN_canonical. Obtains sample from MVN with mean inv(Q)b, and precision matrix Q. 
 This is performed using the procedure described on Algorithm 2.5 from Rue H. and  Held L.'s 
