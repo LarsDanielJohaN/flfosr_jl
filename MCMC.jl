@@ -1,4 +1,6 @@
-using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall
+using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall,BenchmarkTools
+include("BaseUtils.jl") #Imports the methods on BaseUtils.jl
+include("PerformanceUtils.jl") #Imports the methods on PerformanceUtils.jl
 
 #=
 sample_MVN_canonical. Obtains sample from MVN with mean inv(Q)b, and precision matrix Q. 
@@ -6,8 +8,14 @@ This is performed using the procedure described on Algorithm 2.5 from Rue H. and
 Gaussian Markov Random Fields book. 
 =#
 function sample_MVN_canonical(;Q::Matrix{Float64}, b::Vector{Float64} ) #, L::Matrix{Float64})
-    L = cholesky( (Q + Q')./2 ).L
-    return (L' \ (L\b)) + (L'\randn(size(Q)[1]))
+    #L = cholesky( (Q + Q')./2 ).L
+    x = similar(b)
+    y = similar(b)
+    L = cholesky( Symmetric(Q) ).L
+    ldiv!(y, L, b)
+    ldiv!(x, L',y)
+    ldiv!(y, L',randn(size(Q)[1]) )
+    return x .+ y
 end
 
 function get_Z_mat(M_rep)
@@ -23,8 +31,6 @@ function get_Z_mat(M_rep)
     return Z
 
 end
-
-
 #=
 Y: Matrix{Float64} of observations  of dimension T x M with M = M1 + M2 + ... + MN
 X: Matrix{Float64} design matrix of dimension M x L+1 with M = M1 + M2 + ... + MN
@@ -47,20 +53,23 @@ replicate the function with the "ortho" decomposition option, spline.degree = 3,
 and rankZ = 0.999. 
 =#
 
-function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1, tol_sm::Float64 = (1/10^10))
+function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1,  tol_sm::Float64 = (1/10^10))
     #Makes sure that appropiate inputs are recieved. 
     T,M_Y = size(Y)
     M_X, L_p_one = size(X)
     M_M_rep = sum(M_rep)
     @assert M_Y == M_X "Fatal error on flfosr!! Y should be of dimensions (T x M) and X of (M x L+1) but the M's dont coincide. "
     @assert M_M_rep == M_X "Fatal error on flfosr!! X should be of dimensions (M x L+1) and the entries of M_rep (M1 + M2 + ... + MN) should sum to M. They dont. "
+    @assert L_p_one <= length(M_rep) "Fatal error on flfosr!! For this time, we are only allowing for L < N."
+
 
     Tn, M_Y = size(Y) #Obtains number of evaluation points with Tn and total number of functions M_Y
     N = length(M_rep) #Gets total number of subjects.
     tau = range(0, 1, length = Tn) |> collect  #Obtains the observation points.  
-    idx = inverse_rle( 1:N |> collect, M_rep )
 
-    
+    id = 1:N |> collect
+    idx = inverse_rle( id, M_rep )
+
     R"library(spikeSlabGAM) "
 
     R"""
@@ -72,10 +81,13 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     B = rcopy(Matrix{Float64}, R"B"   )
     B_proj = rcopy(Matrix{Float64}, R"Bk")'
     B = B_proj'
+    d = ones(K)
 
+
+
+     
     Y_proj = B_proj*Y #Obtains projected data, now an K x M matrix. 
     Z = get_Z_mat(M_rep)
-
     Alpha = zeros(K, L+1, S +1 ) #Creates K x L+1 x S tensor, each slice K x L+1 x s for s = 1,2,..., S represents the iter's sample of fixed effect coeffients. 
     Gamma = zeros(K, N, S+1) #Creates K x N x S tensor, each slice K x N x s represents s'ths values for the subject specific effects. 
     Omega = zeros(K, M_Y, S+1) #Creates a K x M x S tensor, each slice K x M_Y x s represents the s´ths vales for the specific specific coefficients. 
@@ -92,17 +104,32 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     Sig_Omega = zeros(N, S+1) #Creates a N x S matrix to store the realizations of the visit effect coefficient variances. 
     Sig_Omega[:, 1] = 0.5 .* ones(N)
 
+    low_idx_M_rep = zeros(N)
+    upp_idx_M_rep = zeros(N)
+
+    low_idx_M_rep[1] = 1
+    upp_idx_M_rep[1] = M_rep[1]
+    su = 1 
+
+    for n in 2:N
+        low_idx_M_rep[n] =  su + 1 
+        upp_idx_M_rep[n] = su + M_rep[n]
+        su+= M_rep[n]
+    end
+    low_idx_M_rep = convert(Array{Int64}, low_idx_M_rep)
+    upp_idx_M_rep = convert(Array{Int64}, upp_idx_M_rep)
+    alp_sig_omega = a_omeg .+ (M_rep.*(K/2) )
+
+
     ##---------------------------------------------------------------------------------------------------------------------------------
     #Reserve memory space or calculate terms which will be used repeatedly during the MCMC scheme (i.e. to reduce allocation time and calculation time per iteration)
-
     ell_alpha_k = zeros(L+1, M_Y) #Creates fixed memory for storing the terms dkX'(Vk - Wk).
     Q_inv_gamma_k = zeros(N) #Creates fixed memory for storing the terms dk Z'Vk(yk - Xalphak).
     Q_inv_omega_k = zeros(M_Y) #Creates fixed memory for storing terms diag({ dk/sigma_eps^2 + 1/sigma_omegai^2  })
-    su = 1
     ##---------------------------------------------------------------------------------------------------------------------------------
 
     Alphaf = zeros(Tn, L+1, S - S_burn) #Creates a Tn x L+1 x S- S_burn tensor to store Alpha realizations in their functional form. 
-    @views begin
+    @views begin #Tells julia that, when accessing an array (e.g. A[i,j,z]), a temporal array should not be generated. It should view/modify the elements of A[i,j,k] directly. 
         for s in 2:(S+1) #Do MCMC iterations. 
             if mod(s, 200) == 0 
                 println("On iteration $(s) from $(S)")
@@ -113,16 +140,15 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
                 ##---------------------------------------------------------------------------------------------------------------------------------
                 ell_alpha_k = X' *(  Diagonal(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1] .+ M_rep .*Sig_Gamma[s-1] ), M_rep) )) #Good to go
                 Alpha[k, :, s] =  sample_MVN_canonical( Q = Diagonal(1 ./ Sig_Alpha[:, s-1]) + ell_alpha_k*X ,  b = ell_alpha_k*Y_proj[k, :] ) #Good to go. 
-
                 ##---------------------------------------------------------------------------------------------------------------------------------
-                Q_inv_gamma_k = 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+ Sig_Omega[:, s-1]  ) ) ) #Good to go. 
-                #Vk = inverse_rle(1 ./ (sig_eps[s-1] .+ d[k].*Sig_Omega[:, s-1]), M_rep) 
-                Gamma[k, :, s] = rand(MvNormal(  Diagonal(Q_inv_gamma_k)* (Z')*(  Diagonal(inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep) )*(Y_proj[k, :] - X*Alpha[k, :, s]) ), Diagonal(Q_inv_gamma_k)                          )         ,1)
+                Q_inv_gamma_k = 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) #Good to go. 
+                Gamma[k, :, s] =   rand(MvNormal(  Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
 
                 ##---------------------------------------------------------------------------------------------------------------------------------
                 Q_inv_omega_k = inverse_rle(   1 ./ ( (1/Sig_Eps[s-1]) .+ (1 ./ Sig_Omega[:, s-1]) ), M_rep)
-                #ell_omegak = (d[k]/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Z*Gamma[k, :, s] )
-                Omega[k , :, s] = rand(MvNormal(Diagonal(Q_inv_omega_k) * (  (1/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Gamma[k, idx, s] )   ),  Diagonal(Q_inv_omega_k)    ), 1)
+                Omega[k , :, s] = rand(MvNormal(Q_inv_omega_k .* (  (1/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Gamma[k, idx, s] )   ),  Diagonal(Q_inv_omega_k)    ), 1)
+
+
             end 
 
             #=
@@ -130,31 +156,16 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
             therefore, taking the norm of the previous consitutues the sum squared residuals. 
             =#
             Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2, 1/( sum(    ((Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s])).^2 ) ./ 2 )   )), 1)[1] #Obtain new realization for the observation error variance. 
-
-            ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-            #lam_sig_alpha = 1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  )
-            Threads.@threads for l in 1:(L+1) #Obtains new samples for fixed effect coefficient variances. 
-                Sig_Alpha[l, s] =  1.0/rand(Distributions.Gamma(  a_alph+ K/2,     1/(b_alph + sum( (Alpha[:, l,s].^2) ./ 2))  ) ,1)[1] 
-            end
-            ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
+            Sig_Alpha[:, s] = 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
             #=
             Note that sum(Gamma[:, :, s] .^2 ) takes all coefficients for subject effect functions, squares them and smbs them. 
             =#
             Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))    ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
-
-            ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            su = 1 
-            Sig_Omega[1, s] = 1.0/ rand(Distributions.Gamma(a_omeg + M_rep[1]*K/2,  1/(    b_omeg + sum( (Omega[ : ,1:M_rep[1] , s].^2) ./2    )       )   ), 1)[1]
-            for n in 2:N 
-                Sig_Omega[n, s] = 1.0/ rand(Distributions.Gamma(a_omeg + M_rep[n]*K/2,  1/(    b_omeg + sum(  (Omega[ : ,su + 1:su + M_rep[n] , s].^2) ./ 2    )      )   ), 1)[1]
-                su+= M_rep[n]
-            end 
+            Sig_Omega[:, s] = 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
             ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         end 
     end
-    for s in 1:(S - S_burn)  
+    Threads.@threads for s in 1:(S - S_burn)  
         Alphaf[: ,:, s] = B*Alpha[: ,:, s+S_burn-1]        
     end
 
